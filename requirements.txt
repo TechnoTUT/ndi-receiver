@@ -4,3 +4,4 @@ typing_extensions==4.12.2
 cyndilib==0.0.7
 pysdl2==0.9.17
 pysdl2-dll==2.32.0
+pyopengl==3.1.9
