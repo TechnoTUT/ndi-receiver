@@ -157,6 +157,7 @@ def init_window(title: str, width: int, height: int, fullscreen: bool):
         raise RuntimeError(f"SDL_CreateWindowエラー: {sdl2.SDL_GetError()}")
 
     sdl2.SDL_GL_CreateContext(window)
+    sdl2.SDL_ShowCursor(sdl2.SDL_DISABLE)
     return window
 
 def run_display_loop(frame_gen, options: Options):
