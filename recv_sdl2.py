@@ -4,6 +4,9 @@ from typing import NamedTuple, TYPE_CHECKING
 from typing_extensions import Self
 import enum
 import time
+import gc
+import threading
+import queue
 
 import click
 
@@ -38,8 +41,8 @@ class RecvFmt(enum.Enum):
 class Bandwidth(enum.Enum):
     """受信帯域
     """
-    lowest = RecvBandwidth.lowest      #: 最低
-    highest = RecvBandwidth.highest    #: 最高
+    lowest = RecvBandwidth.lowest
+    highest = RecvBandwidth.highest
 
     @classmethod
     def from_str(cls, name: str) -> Self:
@@ -74,14 +77,10 @@ def get_source(finder: Finder, name: str) -> Source:
 
 
 def wait_for_first_frame(receiver: Receiver) -> None:
-    """最初の数フレームはデータを含まないことがあるため、
-    データを含む最初のフレームを受信するまで待機する
+    """データを含む最初のフレームを受信するまで待機する
     """
     vf = receiver.frame_sync.video_frame
     assert vf is not None
-    frame_rate = vf.get_frame_rate()
-    # フレームレートが0の場合のフォールバック
-    wait_time = float(1 / frame_rate) if frame_rate > 0 else 0.033
     click.echo('最初のフレームを待機中...')
     while receiver.is_connected():
         receiver.frame_sync.capture_video()
@@ -89,31 +88,28 @@ def wait_for_first_frame(receiver: Receiver) -> None:
         if min(resolution) > 0 and vf.get_data_size() > 0:
             click.echo('フレームを取得しました。')
             return
-        time.sleep(wait_time)
+        time.sleep(0.01)
 
 def render_texture(frame: bytes, tex_w: int, tex_h: int, win_w: int, win_h: int, texture_id: int, recv_fmt: RecvFmt):
     """受信したフレームデータをOpenGLテクスチャとしてアスペクト比を維持して描画する
     """
-    # 受信フォーマットに応じてOpenGLのピクセルフォーマットを決定
+    if not frame: return
+
     if recv_fmt == RecvFmt.bgr:
         gl_format = GL_BGRA
-    else:  # UYVY (cyndilibによりRGBAに変換) および RGB の場合
+    else:
         gl_format = GL_RGBA
 
     glBindTexture(GL_TEXTURE_2D, texture_id)
-    # テクスチャデータをGPUに転送
-    # 内部フォーマットは互換性のためGL_RGBAに固定
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tex_w, tex_h, 0,
                  gl_format, GL_UNSIGNED_BYTE, frame)
     
-    # テクスチャのフィルタリング設定
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
 
-    # 画面をクリア
+    glClearColor(0.0, 0.0, 0.0, 1.0)
     glClear(GL_COLOR_BUFFER_BIT)
 
-    # アスペクト比を計算して維持
     src_ratio = tex_w / tex_h
     dst_ratio = win_w / win_h
 
@@ -124,8 +120,6 @@ def render_texture(frame: bytes, tex_w: int, tex_h: int, win_w: int, win_h: int,
         scale_x = src_ratio / dst_ratio
         scale_y = 1.0
 
-    # 画面に四角形を描画し、テクスチャをマッピング
-    # Y座標を反転させて上下反転を修正する
     glBegin(GL_QUADS)
     glTexCoord2f(0.0, 1.0); glVertex2f(-scale_x, -scale_y)
     glTexCoord2f(1.0, 1.0); glVertex2f( scale_x, -scale_y)
@@ -133,13 +127,18 @@ def render_texture(frame: bytes, tex_w: int, tex_h: int, win_w: int, win_h: int,
     glTexCoord2f(0.0, 0.0); glVertex2f(-scale_x,  scale_y)
     glEnd()
 
+def render_waiting_message():
+    """接続待機中に表示する画面を描画する
+    """
+    glClearColor(0.0, 0.0, 0.0, 1.0)
+    glClear(GL_COLOR_BUFFER_BIT)
+
 def init_window(title: str, width: int, height: int, fullscreen: bool):
     """SDL2とOpenGLを使用してウィンドウを初期化する
     """
     if sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO) != 0:
         raise RuntimeError(f"SDL_Initエラー: {sdl2.SDL_GetError()}")
 
-    # OpenGLのバージョンを指定
     sdl2.SDL_GL_SetAttribute(sdl2.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
     sdl2.SDL_GL_SetAttribute(sdl2.SDL_GL_CONTEXT_MINOR_VERSION, 1)
     
@@ -160,145 +159,168 @@ def init_window(title: str, width: int, height: int, fullscreen: bool):
     sdl2.SDL_ShowCursor(sdl2.SDL_DISABLE)
     return window
 
-def run_display_loop(frame_gen, options: Options):
-    """メインの表示ループ。フレームを継続的に取得し、画面に描画する
+def ndi_capture_thread(receiver: Receiver, vf: VideoFrameSync, frame_queue: queue.Queue, stop_event: threading.Event):
+    """バックグラウンドでNDIフレームをキャプチャし続けるワーカースレッド
     """
-    # 最初のフレームを取得して解像度を得る
-    try:
-        frame, tex_w, tex_h = next(frame_gen)
-    except StopIteration:
-        click.echo("フレームジェネレータからフレームを取得できませんでした。終了します。")
-        return
+    while not stop_event.is_set():
+        if not receiver.is_connected():
+            break
+        
+        receiver.frame_sync.capture_video()
+        tex_w, tex_h = vf.get_resolution()
+        
+        if tex_w > 0 and tex_h > 0 and vf.get_data_size() > 0:
+            try:
+                # キューが満杯の場合は古いフレームを捨てて新しいフレームを入れる
+                frame_queue.put_nowait((bytes(vf), tex_w, tex_h))
+            except queue.Full:
+                try:
+                    frame_queue.get_nowait() # 古いものを捨てる
+                    frame_queue.put_nowait((bytes(vf), tex_w, tex_h)) # 新しいものを入れる
+                except queue.Empty:
+                    pass # タイミングの問題で空になった場合は何もしない
+        else:
+            time.sleep(0.001) # CPUの過剰な使用を防ぐ
     
-    # 初期ウィンドウサイズはフレーム解像度に合わせる
-    win_w, win_h = tex_w, tex_h
+    frame_queue.put(None) # スレッド終了のシグナル
+    click.echo("キャプチャスレッドを停止しました。")
+
+def play_sdl(options: Options):
+    """SDLを使用してNDIストリームを再生するメインロジック。
+    """
+    window = init_window("NDI Viewer", 1280, 720, options.fullscreen)
     
-    window = init_window("NDI Viewer", win_w, win_h, options.fullscreen)
-    
-    # ウィンドウ作成後、実際のウィンドウサイズを取得し直す
-    w_ptr = sdl2.c_int()
-    h_ptr = sdl2.c_int()
+    w_ptr, h_ptr = sdl2.c_int(), sdl2.c_int()
     sdl2.SDL_GetWindowSize(window, w_ptr, h_ptr)
     win_w, win_h = w_ptr.value, h_ptr.value
 
-    # OpenGL初期化
     glEnable(GL_TEXTURE_2D)
-    glViewport(0, 0, win_w, win_h) # 取得した正しいサイズでビューポートを設定
+    glViewport(0, 0, win_w, win_h)
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
     glOrtho(-1, 1, -1, 1, -1, 1)
     glMatrixMode(GL_MODELVIEW)
     glLoadIdentity()
-
+    
     texture_id = glGenTextures(1)
-
-    event = sdl2.SDL_Event()
+    
+    finder = None
+    receiver = None
+    capture_thread = None
+    stop_thread_event = None
+    
     running = True
+    event = sdl2.SDL_Event()
+    
+    is_connected = False
+    reconnect_cooldown_until = 0
+    
+    last_frame_data = None
+    last_frame_w, last_frame_h = 0, 0
 
-    while running:
-        # イベント処理
-        while sdl2.SDL_PollEvent(event):
-            if event.type == sdl2.SDL_QUIT:
-                running = False
-            elif event.type == sdl2.SDL_WINDOWEVENT:
-                if event.window.event == sdl2.SDL_WINDOWEVENT_RESIZED:
-                    # ウィンドウサイズ変更時にビューポートを更新
+    try:
+        finder = Finder()
+        vf = VideoFrameSync()
+        frame_queue = queue.Queue(maxsize=2)
+
+        while running:
+            while sdl2.SDL_PollEvent(event):
+                if event.type == sdl2.SDL_QUIT:
+                    running = False
+                elif event.type == sdl2.SDL_KEYDOWN and event.key.keysym.sym == sdl2.SDLK_ESCAPE:
+                    running = False
+                elif event.type == sdl2.SDL_WINDOWEVENT and event.window.event == sdl2.SDL_WINDOWEVENT_RESIZED:
                     win_w, win_h = event.window.data1, event.window.data2
                     glViewport(0, 0, win_w, win_h)
 
-        # アスペクト比を維持して描画
-        render_texture(frame, tex_w, tex_h, win_w, win_h, texture_id, options.recv_fmt)
+            if not is_connected:
+                # --- 切断状態の処理 ---
+                if time.time() < reconnect_cooldown_until:
+                    render_waiting_message()
+                else:
+                    click.echo("NDI接続を試行しています...")
+                    try:
+                        source = get_source(finder, options.sender_name)
+                        receiver = Receiver(
+                            color_format=options.recv_fmt.value,
+                            bandwidth=options.recv_bandwidth.value,
+                        )
+                        receiver.frame_sync.set_video_frame(vf)
+                        receiver.set_source(source)
 
-        # ダブルバッファリングをスワップして画面を更新
-        sdl2.SDL_GL_SwapWindow(window)
+                        i = 0
+                        while not receiver.is_connected():
+                            if i > 30: raise Exception('タイムアウト')
+                            time.sleep(0.1)
+                            i += 1
+                        
+                        wait_for_first_frame(receiver)
+                        
+                        stop_thread_event = threading.Event()
+                        capture_thread = threading.Thread(
+                            target=ndi_capture_thread,
+                            args=(receiver, vf, frame_queue, stop_thread_event)
+                        )
+                        capture_thread.start()
+                        is_connected = True
+                        click.echo("NDIソースに接続しました。")
 
-        # 次のフレームを取得
-        try:
-            frame, tex_w, tex_h = next(frame_gen)
-        except StopIteration:
-            break
+                    except Exception as e:
+                        click.echo(f"接続試行中にエラー: {e}", err=True)
+                        if receiver:
+                            receiver = None; gc.collect()
+                        reconnect_cooldown_until = time.time() + 5.0 # 5秒後に再試行
+                
+                render_waiting_message()
 
+            else:
+                # --- 接続状態の処理 ---
+                try:
+                    frame_info = frame_queue.get_nowait()
+                    if frame_info is None: # スレッド終了シグナル
+                        raise ConnectionError("キャプチャスレッドが停止しました。")
+                    
+                    last_frame_data, last_frame_w, last_frame_h = frame_info
+                    render_texture(last_frame_data, last_frame_w, last_frame_h, win_w, win_h, texture_id, options.recv_fmt)
 
-    # クリーンアップ
-    glDeleteTextures(1, [texture_id])
-    sdl2.SDL_DestroyWindow(window)
-    sdl2.SDL_Quit()
+                except queue.Empty:
+                    # 新しいフレームがない場合は、最後のフレームを再描画
+                    render_texture(last_frame_data, last_frame_w, last_frame_h, win_w, win_h, texture_id, options.recv_fmt)
+                except (ConnectionError, BrokenPipeError) as e:
+                    click.echo(f"接続が失われました: {e}", err=True)
+                    is_connected = False
+                    if stop_thread_event: stop_thread_event.set()
+                    if capture_thread: capture_thread.join()
+                    capture_thread = None
+                    if receiver: receiver = None; gc.collect()
+                    # キューをクリア
+                    while not frame_queue.empty(): frame_queue.get()
+                    reconnect_cooldown_until = time.time() + 5.0
 
-def ndi_frame_generator(receiver, vf):
-    """NDIフレームを継続的に生成するジェネレータ
-    """
-    while receiver.is_connected():
-        receiver.frame_sync.capture_video()
-        xres, yres = vf.get_resolution()
-        if xres > 0 and yres > 0:
-            yield bytes(vf), xres, yres
+            sdl2.SDL_GL_SwapWindow(window)
+            time.sleep(0.001) # メインループのCPU使用率を抑制
 
-def play_sdl(options: Options):
-    """SDLを使用してNDIストリームを再生するメインロジック
-    """
-    with Finder() as finder:
-        source = get_source(finder, options.sender_name)
+    finally:
+        click.echo("クリーンアップ処理を実行しています...")
+        if stop_thread_event: stop_thread_event.set()
+        if capture_thread: capture_thread.join()
+        if finder and hasattr(finder, 'destroy'): finder.destroy()
         
-        # Receiverはコンテキストマネージャをサポートしていないため、with文を使用しない
-        receiver = Receiver(
-            color_format=options.recv_fmt.value,
-            bandwidth=options.recv_bandwidth.value,
-        )
-        
-        vf = VideoFrameSync()
-        receiver.frame_sync.set_video_frame(vf)
-        receiver.set_source(source)
+        glDeleteTextures(1, [texture_id])
+        sdl2.SDL_DestroyWindow(window)
+        sdl2.SDL_Quit()
+        click.echo("プログラムを終了しました。")
 
-        i = 0
-        while not receiver.is_connected():
-            if i > 30:
-                raise Exception('タイムアウト：NDIソースへの接続に失敗しました。')
-            time.sleep(0.1)
-            i += 1
-
-        wait_for_first_frame(receiver)
-
-        # ストリームが安定するまで、最初の数フレームを意図的に破棄する
-        # これにより、初期の不完全なフレームによる問題を回避する
-        click.echo('ストリームを安定させています...')
-        frame_rate = vf.get_frame_rate()
-        wait_time = float(1 / frame_rate) if frame_rate > 0 else 0.033
-        for _ in range(5): # 5フレームほど破棄してみる
-            receiver.frame_sync.capture_video()
-            time.sleep(wait_time)
-
-        frame_gen = ndi_frame_generator(receiver, vf)
-        run_display_loop(frame_gen, options)
 
 @click.command()
 @click.option(
-    '-s', '--sender-name',
-    type=str,
-    default='ffmpeg_sender',
-    show_default=True,
-    help='接続するNDIソース名',
-)
+    '-s', '--sender-name', type=str, default='ffmpeg_sender', show_default=True, help='接続するNDIソース名')
 @click.option(
-    '-f', '--recv-fmt',
-    type=click.Choice(choices=[m.name for m in RecvFmt]),
-    default='rgb',
-    show_default=True,
-    show_choices=True,
-    help='受信するピクセルフォーマット'
-)
+    '-f', '--recv-fmt', type=click.Choice(choices=[m.name for m in RecvFmt]), default='rgb', show_default=True, help='受信するピクセルフォーマット')
 @click.option(
-    '-b', '--recv-bandwidth',
-    type=click.Choice(choices=[m.name for m in Bandwidth]),
-    default='highest',
-    show_default=True,
-    show_choices=True,
-    help='受信帯域'
-)
+    '-b', '--recv-bandwidth', type=click.Choice(choices=[m.name for m in Bandwidth]), default='highest', show_default=True, help='受信帯域')
 @click.option(
-    '--fullscreen',
-    is_flag=True,
-    help='フルスクリーンモードで起動する'
-)
+    '--fullscreen', is_flag=True, help='フルスクリーンモードで起動する')
 def main(sender_name: str, recv_fmt: str, recv_bandwidth: str, fullscreen: bool):
     """SDL2とPyOpenGLを使用してNDIストリームを表示するビューア"""
     options = Options(
@@ -310,7 +332,7 @@ def main(sender_name: str, recv_fmt: str, recv_bandwidth: str, fullscreen: bool)
     try:
         play_sdl(options)
     except Exception as e:
-        click.echo(f"エラーが発生しました: {e}", err=True)
+        click.echo(f"致命的なエラーが発生しました: {e}", err=True)
 
 
 if __name__ == '__main__':
