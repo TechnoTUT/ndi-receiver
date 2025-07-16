@@ -1,0 +1,13 @@
+[Unit]
+Description=NDI Receiver (SDL2)
+After=network.target
+
+[Service]
+ExecStart=/path/to/ndi-receiver/start.sh
+WorkingDirectory=/path/to/ndi-receiver
+Restart=always
+RestartSec=3
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+
+[Install]
+WantedBy=default.target
