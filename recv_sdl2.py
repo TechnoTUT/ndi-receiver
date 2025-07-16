@@ -5,8 +5,6 @@ from typing_extensions import Self
 import enum
 import time
 import gc
-import threading
-import queue
 
 import click
 
@@ -93,7 +91,9 @@ def wait_for_first_frame(receiver: Receiver) -> None:
 def render_texture(frame: bytes, tex_w: int, tex_h: int, win_w: int, win_h: int, texture_id: int, recv_fmt: RecvFmt):
     """受信したフレームデータをOpenGLテクスチャとしてアスペクト比を維持して描画する
     """
-    if not frame: return
+    if not frame or tex_w == 0 or tex_h == 0:
+        render_waiting_message()
+        return
 
     if recv_fmt == RecvFmt.bgr:
         gl_format = GL_BGRA
@@ -159,32 +159,6 @@ def init_window(title: str, width: int, height: int, fullscreen: bool):
     sdl2.SDL_ShowCursor(sdl2.SDL_DISABLE)
     return window
 
-def ndi_capture_thread(receiver: Receiver, vf: VideoFrameSync, frame_queue: queue.Queue, stop_event: threading.Event):
-    """バックグラウンドでNDIフレームをキャプチャし続けるワーカースレッド
-    """
-    while not stop_event.is_set():
-        if not receiver.is_connected():
-            break
-        
-        receiver.frame_sync.capture_video()
-        tex_w, tex_h = vf.get_resolution()
-        
-        if tex_w > 0 and tex_h > 0 and vf.get_data_size() > 0:
-            try:
-                # キューが満杯の場合は古いフレームを捨てて新しいフレームを入れる
-                frame_queue.put_nowait((bytes(vf), tex_w, tex_h))
-            except queue.Full:
-                try:
-                    frame_queue.get_nowait() # 古いものを捨てる
-                    frame_queue.put_nowait((bytes(vf), tex_w, tex_h)) # 新しいものを入れる
-                except queue.Empty:
-                    pass # タイミングの問題で空になった場合は何もしない
-        else:
-            time.sleep(0.001) # CPUの過剰な使用を防ぐ
-    
-    frame_queue.put(None) # スレッド終了のシグナル
-    click.echo("キャプチャスレッドを停止しました。")
-
 def play_sdl(options: Options):
     """SDLを使用してNDIストリームを再生するメインロジック。
     """
@@ -206,8 +180,6 @@ def play_sdl(options: Options):
     
     finder = None
     receiver = None
-    capture_thread = None
-    stop_thread_event = None
     
     running = True
     event = sdl2.SDL_Event()
@@ -221,7 +193,6 @@ def play_sdl(options: Options):
     try:
         finder = Finder()
         vf = VideoFrameSync()
-        frame_queue = queue.Queue(maxsize=2)
 
         while running:
             while sdl2.SDL_PollEvent(event):
@@ -235,9 +206,8 @@ def play_sdl(options: Options):
 
             if not is_connected:
                 # --- 切断状態の処理 ---
-                if time.time() < reconnect_cooldown_until:
-                    render_waiting_message()
-                else:
+                render_waiting_message()
+                if time.time() >= reconnect_cooldown_until:
                     click.echo("NDI接続を試行しています...")
                     try:
                         source = get_source(finder, options.sender_name)
@@ -255,13 +225,6 @@ def play_sdl(options: Options):
                             i += 1
                         
                         wait_for_first_frame(receiver)
-                        
-                        stop_thread_event = threading.Event()
-                        capture_thread = threading.Thread(
-                            target=ndi_capture_thread,
-                            args=(receiver, vf, frame_queue, stop_thread_event)
-                        )
-                        capture_thread.start()
                         is_connected = True
                         click.echo("NDIソースに接続しました。")
 
@@ -270,41 +233,38 @@ def play_sdl(options: Options):
                         if receiver:
                             receiver = None; gc.collect()
                         reconnect_cooldown_until = time.time() + 5.0 # 5秒後に再試行
-                
-                render_waiting_message()
-
             else:
                 # --- 接続状態の処理 ---
-                try:
-                    frame_info = frame_queue.get_nowait()
-                    if frame_info is None: # スレッド終了シグナル
-                        raise ConnectionError("キャプチャスレッドが停止しました。")
-                    
-                    last_frame_data, last_frame_w, last_frame_h = frame_info
-                    render_texture(last_frame_data, last_frame_w, last_frame_h, win_w, win_h, texture_id, options.recv_fmt)
-
-                except queue.Empty:
-                    # 新しいフレームがない場合は、最後のフレームを再描画
-                    render_texture(last_frame_data, last_frame_w, last_frame_h, win_w, win_h, texture_id, options.recv_fmt)
-                except (ConnectionError, BrokenPipeError) as e:
-                    click.echo(f"接続が失われました: {e}", err=True)
+                if not receiver or not receiver.is_connected():
+                    click.echo("接続が失われました。", err=True)
                     is_connected = False
-                    if stop_thread_event: stop_thread_event.set()
-                    if capture_thread: capture_thread.join()
-                    capture_thread = None
                     if receiver: receiver = None; gc.collect()
-                    # キューをクリア
-                    while not frame_queue.empty(): frame_queue.get()
                     reconnect_cooldown_until = time.time() + 5.0
+                    last_frame_data, last_frame_w, last_frame_h = None, 0, 0
+                else:
+                    try:
+                        receiver.frame_sync.capture_video()
+                        tex_w, tex_h = vf.get_resolution()
+                        
+                        if tex_w > 0 and tex_h > 0 and vf.get_data_size() > 0:
+                            last_frame_data = bytes(vf)
+                            last_frame_w, last_frame_h = tex_w, tex_h
+                        
+                        render_texture(last_frame_data, last_frame_w, last_frame_h, win_w, win_h, texture_id, options.recv_fmt)
+
+                    except Exception as e:
+                        click.echo(f"フレームの取得または描画中にエラー: {e}", err=True)
+                        is_connected = False
+                        if receiver: receiver = None; gc.collect()
+                        reconnect_cooldown_until = time.time() + 5.0
 
             sdl2.SDL_GL_SwapWindow(window)
             time.sleep(0.001) # メインループのCPU使用率を抑制
 
     finally:
         click.echo("クリーンアップ処理を実行しています...")
-        if stop_thread_event: stop_thread_event.set()
-        if capture_thread: capture_thread.join()
         if finder and hasattr(finder, 'destroy'): finder.destroy()
+        if receiver: receiver = None; gc.collect()
         
         glDeleteTextures(1, [texture_id])
         sdl2.SDL_DestroyWindow(window)
