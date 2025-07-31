@@ -16,7 +16,7 @@ $ cd ndi-receiver
 $ python -m venv venv
 $ source venv/bin/activate
 $ pip install -r requirements.txt
-$ python recv_sdl2.py -s "<NDI Source Name>" --fullscreen
+$ python rx_sdl2.py -s "<NDI Source Name>" --fullscreen
 ```
 
 Systemdを使用して自動起動する場合は、以下の手順を実行します。なお、GUIなしの環境でも動作します。

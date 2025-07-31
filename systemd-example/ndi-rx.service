@@ -3,7 +3,7 @@ Description=NDI Receiver (SDL2)
 After=network.target
 
 [Service]
-ExecStart=/path/to/ndi-receiver/start.sh
+ExecStart=/path/to/ndi-receiver/start-rx.sh
 WorkingDirectory=/path/to/ndi-receiver
 Restart=always
 RestartSec=3
