@@ -3,8 +3,8 @@ Description=NDI Receiver (SDL2)
 After=network.target
 
 [Service]
-ExecStart=/path/to/ndi-receiver/start-rx.sh
-WorkingDirectory=/path/to/ndi-receiver
+ExecStart=/path/to/utone-ndi-utils/start-rx.sh
+WorkingDirectory=/path/to/utone-ndi-utils
 Restart=always
 RestartSec=3
 Environment=XDG_RUNTIME_DIR=/run/user/%U

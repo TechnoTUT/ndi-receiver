@@ -3,8 +3,8 @@ Description=NDI Sender
 After=network.target
 
 [Service]
-ExecStart=/path/to/ndi-receiver/start-tx.sh
-WorkingDirectory=/path/to/ndi-receiver
+ExecStart=/path/to/utone-ndi-utils/start-tx.sh
+WorkingDirectory=/path/to/utone-ndi-utils
 Restart=always
 RestartSec=3
 

@@ -11,8 +11,8 @@ $ sudo apt install python3 python3-pip python3-venv avahi-daemon libgl1-mesa-dev
 
 次に、リポジトリをクローンし、仮想環境を作成して依存関係をインストールします。
 ```bash
-$ git clone https://github.com/TechnoTUT/ndi-receiver.git
-$ cd ndi-receiver
+$ git clone https://github.com/TechnoTUT/utone-ndi-utils.git
+$ cd utone-ndi-utils
 $ python3 -m venv venv
 $ source venv/bin/activate
 $ pip install -r requirements.txt
