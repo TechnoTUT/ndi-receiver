@@ -137,7 +137,7 @@ def send(opts: Options) -> None:
 )
 @click.option('-x', '--x-res', type=int, default=1920, show_default=True)
 @click.option('-y', '--y-res', type=int, default=1080, show_default=True)
-@click.option('--fps', type=str, default='30', show_default=True)
+@click.option('--fps', type=str, default='29.97', show_default=True)
 @click.option(
     '-d', '--video-device',
     type=str,
