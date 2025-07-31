@@ -6,7 +6,7 @@ NDIを活用することでDJイベント "The Utopia Tone" の映像伝送をIP
 動作にはPython3及びavahi-daemon、libgl1-mesa-devが必要です。
 以下のコマンドで必要なパッケージをインストールしてください。
 ```bash
-$ sudo apt install python3 python3-pip python3-venv avahi-daemon libgl1-mesa
+$ sudo apt install python3 python3-pip python3-venv avahi-daemon libgl1-mesa-dev
 ```
 
 次に、リポジトリをクローンし、仮想環境を作成して依存関係をインストールします。
