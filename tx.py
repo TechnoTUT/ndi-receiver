@@ -26,7 +26,6 @@ FF_CMD = ('{ffmpeg} -f v4l2 '
            '-s {xres}x{yres} '
            '-r "{fps}" '
            '-i "{video_device}" '
-           '-vf "scale=in_range=pc:out_range=tv:in_color_matrix=auto:out_color_matrix=bt709" '
            '-pix_fmt {pix_fmt.name} -f rawvideo pipe:')
 
 
