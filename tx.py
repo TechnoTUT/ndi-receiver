@@ -15,17 +15,19 @@ from cyndilib.wrapper.ndi_structs import FourCC
 from cyndilib.video_frame import VideoSendFrame
 from cyndilib.sender import Sender
 
+import select
+
 
 FF_CMD = ('{ffmpeg} -f v4l2 '
-           '-fflags nobuffer '
-           '-probesize 32 -analyzeduration 0 '
+           '-thread_queue_size 64 '
+           '-fflags nobuffer -flags low_delay -strict experimental '
+           '-analyzeduration 0 -probesize 32 '
            '-input_format mjpeg '
            '-s {xres}x{yres} '
            '-r "{fps}" '
            '-i "{video_device}" '
            '-vf "scale=in_range=pc:out_range=tv:in_color_matrix=auto:out_color_matrix=bt709" '
            '-pix_fmt {pix_fmt.name} -f rawvideo pipe:')
-
 
 
 class PixFmt(enum.Enum):
@@ -113,25 +115,17 @@ def send(opts: Options) -> None:
 
     with sender:
         with ffmpeg_proc(opts) as ff_proc:
-            stdout = cast(io.BytesIO, ff_proc.stdout)
+            stdout = cast(io.BufferedReader, ff_proc.stdout)
+            poller = select.poll()
+            poller.register(stdout, select.POLLIN)
             while True:
                 if ff_proc.returncode is not None:
                     break
-                # Read from the ffmpeg process into a view of the bytearray
-                num_read = stdout.readinto(mv)
 
-                # The first few reads might be empty, ignore
-                if num_read == 0:
-                    continue
-
-                # Pass the memoryview directly to the sender
-                # (using the buffer protocol)
-                sender.write_video_async(mv)
-
-                i += 1
-                if i % 10 == 0:
-                    ff_proc.poll()
-
+                if poller.poll(10):  # 10ms timeout
+                    num_read = stdout.readinto(mv)
+                    if num_read > 0:
+                        sender.write_video_async(mv)
 
 
 @click.command()
