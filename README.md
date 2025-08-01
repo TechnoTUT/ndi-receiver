@@ -3,10 +3,10 @@ NDIを活用することでDJイベント "The Utopia Tone" の映像伝送をIP
 PythonとSDL2を使用してNDIソースを受信し、全画面表示を行ったり、FFmpegを使用してNDIソースの送信を行います。
 
 ## 使い方
-動作にはPython3及びavahi-daemon、libgl1-mesa-dev、ffmpegが必要です。
+動作にはPython3及びavahi-daemon、libgl1-mesa-dev、gstreamerが必要です。
 以下のコマンドで必要なパッケージをインストールしてください。
 ```bash
-$ sudo apt install python3 python3-pip python3-venv avahi-daemon libgl1-mesa-dev ffmpeg
+$ sudo apt install python3 python3-pip python3-venv avahi-daemon libgl1-mesa-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav gstreamer1.0-tools gstreamer1.0-x gstreamer1.0-alsa gstreamer1.0-gl gstreamer1.0-gtk3 gstreamer1.0-qt5 gstreamer1.0-pulseaudio
 ```
 
 次に、リポジトリをクローンし、仮想環境を作成して依存関係をインストールします。

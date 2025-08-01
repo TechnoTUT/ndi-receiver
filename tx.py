@@ -1,175 +1,200 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
-from typing import NamedTuple, Generator, Any, cast
+from typing import NamedTuple, Any, Generator
 from typing_extensions import Self
 import enum
-import io
-import subprocess
-import shlex
 from fractions import Fraction
 from contextlib import contextmanager
+import time
+import subprocess
+import shlex
 
 import click
+import cv2
+import numpy as np
 
-from cyndilib.wrapper.ndi_structs import FourCC
-from cyndilib.video_frame import VideoSendFrame
-from cyndilib.sender import Sender
-
-import select
-
-
-FF_CMD = ('{ffmpeg} -f v4l2 '
-           '-thread_queue_size 64 '
-           '-fflags nobuffer -flags low_delay -strict experimental '
-           '-analyzeduration 0 -probesize 32 '
-           '-input_format mjpeg '
-           '-s {xres}x{yres} '
-           '-r "{fps}" '
-           '-i "{video_device}" '
-           '-pix_fmt {pix_fmt.name} -f rawvideo pipe:')
+# pip install cyndilib
+try:
+    from cyndilib.wrapper.ndi_structs import FourCC
+    from cyndilib.video_frame import VideoSendFrame
+    from cyndilib.sender import Sender
+except ImportError:
+    print("Error: cyndilib is not installed. Please run 'pip install cyndilib'")
+    exit(1)
 
 
 class PixFmt(enum.Enum):
-    """Maps ffmpeg's ``pix_fmt`` names to their corresponding
-    :class:`FourCC <cyndilib.wrapper.ndi_structs.FourCC>` types
     """
-    uyvy422 = FourCC.UYVY   #: uyvy422
-    nv12 = FourCC.NV12      #: nv12
-    rgba = FourCC.RGBA      #: rgba
-    bgra = FourCC.BGRA      #: bgra
+    サポートするピクセルフォーマットと、対応するNDIのFourCCをマッピング
+    GStreamerから受け取るBGRフォーマットを変換
+    """
+    RGBA = (FourCC.RGBA, cv2.COLOR_BGR2RGBA)
+    BGRA = (FourCC.BGRA, cv2.COLOR_BGR2BGRA)
+
+    def __init__(self, four_cc: FourCC, cv_color_code: int):
+        self.four_cc = four_cc
+        self.cv_color_code = cv_color_code
 
     @classmethod
     def from_str(cls, name: str) -> Self:
-        return cls.__members__[name]
+        try:
+            return cls[name.upper()]
+        except KeyError:
+            raise ValueError(f"Unsupported pixel format: {name}")
 
 
 class Options(NamedTuple):
-    """Options set through the cli
-    """
-    pix_fmt: PixFmt                     #: Pixel format to send
-    xres: int                           #: Horizontal resolution
-    yres: int                           #: Vertical resolution
-    fps: str                            #: Frame rate
-    video_device: str                   #: Video device to read from
-    sender_name: str = 'tx'             #: NDI name for the sender
-    ffmpeg: str = 'ffmpeg'              #: Name/Path of the "ffmpeg" executable
+    pix_fmt: PixFmt
+    xres: int
+    yres: int
+    fps: str
+    video_device: str | int
+    sender_name: str = 'TX'
 
 
-def parse_frame_rate(fr: str) -> Fraction:
-    """Helper for NTSC frame rates (29.97, 59.94)
+def parse_frame_rate(fr_str: str) -> Fraction:
     """
-    if '/' in fr:
-        n, d = [int(s) for s in fr.split('/')]
-    elif '.' in fr:
-        n = round(float(fr)) * 1000
+    "30", "29.97", "30000/1001" のような文字列をFractionオブジェクトに変換
+    """
+    if '/' in fr_str:
+        n, d = [int(s) for s in fr_str.split('/')]
+    elif '.' in fr_str:
+        n = int(float(fr_str) * 1000)
         d = 1001
     else:
-        n = int(fr)
+        n = int(fr_str)
         d = 1
     return Fraction(n, d)
 
 
 @contextmanager
-def ffmpeg_proc(opts: Options) -> Generator[subprocess.Popen[bytes], Any, None]:
-    """Context manager for the ffmpeg subprocess generating frames
-    """
-    ff_cmd = FF_CMD.format(**opts._asdict())
-    ff_proc = subprocess.Popen(shlex.split(ff_cmd), stdout=subprocess.PIPE)
+def gstreamer_process(opts: Options) -> Generator[subprocess.Popen, Any, None]:
+    device_path = f"/dev/video{opts.video_device}"
+    fr = parse_frame_rate(opts.fps)
+
+    # GStreamerパイプライン。出力を標準出力(stdout)に送る
+    # `fd:1` は標準出力を意味する
+    pipeline = (
+        f"gst-launch-1.0 v4l2src device={device_path} ! "
+        f"image/jpeg,width={opts.xres},height={opts.yres},framerate={fr.numerator}/{fr.denominator} ! "
+        f"jpegdec ! "
+        f"videoconvert ! "
+        f"video/x-raw,format=BGR ! " # OpenCVで扱いやすいようにBGRフォーマットを指定
+        f"filesink location=/dev/stdout"
+    )
+
+    print("--- GStreamer Command ---")
+    print(pipeline)
+    print("-------------------------")
+
+    proc = subprocess.Popen(shlex.split(pipeline), stdout=subprocess.PIPE)
+    
+    # プロセスが正常に起動したかを確認
+    time.sleep(2) # GStreamerの起動を待つ
+    if proc.poll() is not None:
+        raise IOError(f"GStreamer process failed to start. Exit code: {proc.returncode}")
+
     try:
-        ff_proc.poll()
-        if ff_proc.returncode is None:
-            yield ff_proc
+        yield proc
     finally:
-        ff_proc.kill()
+        print("Terminating GStreamer process.")
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            print("GStreamer did not terminate gracefully, killing.")
+            proc.kill()
 
 
 def send(opts: Options) -> None:
-    """Send frames generated by ffmpeg's ``testsrc2`` as an |NDI| stream
-
-    The raw frames generated by ffmpeg are sent to a pipe and read from its
-    :attr:`~subprocess.Popen.stdout`.  The data is then fed directly to
-    :meth:`cyndilib.sender.Sender.write_video_async` using an
-    intermediate :class:`memoryview`
     """
+    GStreamerからパイプで受け取ったフレームをNDIストリームとして送信
+    """
+    ndi_fr = parse_frame_rate(opts.fps)
+    
     sender = Sender(opts.sender_name)
-
-    # Build a VideoSendFrame and set its resolution and frame rate
-    # to match the options argument
     vf = VideoSendFrame()
     vf.set_resolution(opts.xres, opts.yres)
-    fr = parse_frame_rate(opts.fps)
-    vf.set_frame_rate(fr)
-    vf.set_fourcc(opts.pix_fmt.value)
-
-    # Add the VideoSendFrame to the sender
+    vf.set_frame_rate(ndi_fr)
+    vf.set_fourcc(opts.pix_fmt.four_cc)
     sender.set_video_frame(vf)
 
-    # Pre-allocate a bytearray to hold frame data and create a view of it
-    # So we can buffer into it from ffmpeg then pass directly to the sender
-    frame_size_bytes = vf.get_data_size()
-    ba = bytearray(frame_size_bytes)
-    mv = memoryview(ba)
-
-    i = 0
+    # 1フレームあたりのバイト数を計算 (高さ x 幅 x 3チャンネル)
+    frame_size_bytes = opts.yres * opts.xres * 3
 
     with sender:
-        with ffmpeg_proc(opts) as ff_proc:
-            stdout = cast(io.BufferedReader, ff_proc.stdout)
-            poller = select.poll()
-            poller.register(stdout, select.POLLIN)
-            while True:
-                if ff_proc.returncode is not None:
-                    break
+        with gstreamer_process(opts) as proc:
+            stdout = proc.stdout
+            if stdout is None:
+                raise IOError("Could not get stdout from GStreamer process.")
 
-                if poller.poll(10):  # 10ms timeout
-                    num_read = stdout.readinto(mv)
-                    if num_read > 0:
-                        sender.write_video_async(mv)
+            print(f"Sending NDI stream '{opts.sender_name}' at {float(ndi_fr):.2f} FPS...")
+            while True:
+                # GStreamerから1フレーム分のデータを読み込む
+                frame_data = stdout.read(frame_size_bytes)
+                if len(frame_data) < frame_size_bytes:
+                    print("GStreamer stream ended or data incomplete.")
+                    break
+                
+                # 読み込んだバイト列をNumPy配列に変換
+                # GStreamerからはBGRフォーマットでデータが来る
+                bgr_frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((opts.yres, opts.xres, 3))
+                
+                # 指定されたピクセルフォーマットに変換
+                converted_frame = cv2.cvtColor(bgr_frame, opts.pix_fmt.cv_color_code)
+                
+                # NDIで送信
+                sender.write_video_async(converted_frame.ravel())
 
 
 @click.command()
 @click.option(
     '--pix-fmt',
-    type=click.Choice(choices=[m.name for m in PixFmt]),
-    default=PixFmt.rgba.name,
+    type=click.Choice([m.name for m in PixFmt], case_sensitive=False),
+    default=PixFmt.RGBA.name,
     show_default=True,
-    show_choices=True,
+    help='Pixel format for the NDI stream.',
 )
-@click.option('-x', '--x-res', type=int, default=1920, show_default=True)
-@click.option('-y', '--y-res', type=int, default=1080, show_default=True)
-@click.option('--fps', type=str, default='29.97', show_default=True)
+@click.option('-x', '--x-res', type=int, default=1920, show_default=True, help='Horizontal resolution.')
+@click.option('-y', '--y-res', type=int, default=1080, show_default=True, help='Vertical resolution.')
+@click.option('--fps', type=str, default='30', show_default=True, help='Frame rate (e.g., 30, 60, 30000/1001).')
 @click.option(
     '-d', '--video-device',
     type=str,
-    default='/dev/video0',
+    default='0',
     show_default=True,
-    help='Path to the video device',
+    help='Video device index (e.g., 0 for /dev/video0).',
 )
 @click.option(
     '-n', '--sender-name',
     type=str,
-    default='tx',
+    default='TX',
     show_default=True,
-    help='NDI name for the sender',
+    help='NDI name for the sender.',
 )
-@click.option(
-    '--ffmpeg',
-    type=str,
-    default='ffmpeg',
-    show_default=True,
-    help='Name/Path of the "ffmpeg" executable',
-)
-def main(pix_fmt: str, x_res: int, y_res: int, fps: str, video_device: str, sender_name: str, ffmpeg: str):
-    opts = Options(
-        pix_fmt=PixFmt.from_str(pix_fmt),
-        xres=x_res,
-        yres=y_res,
-        fps=fps,
-        video_device=video_device,
-        sender_name=sender_name,
-        ffmpeg=ffmpeg,
-    )
-    send(opts)
+def main(pix_fmt: str, x_res: int, y_res: int, fps: str, video_device: str, sender_name: str):
+    """
+    Captures video from a local webcam using a GStreamer subprocess and sends it as an NDI stream.
+    """
+    try:
+        dev = int(video_device) if video_device.isdigit() else video_device
+        opts = Options(
+            pix_fmt=PixFmt.from_str(pix_fmt),
+            xres=x_res,
+            yres=y_res,
+            fps=fps,
+            video_device=dev,
+            sender_name=sender_name,
+        )
+        send(opts)
+    except (IOError, ValueError, KeyboardInterrupt, Exception) as e:
+        if isinstance(e, KeyboardInterrupt):
+            print("\nStream stopped by user.")
+        else:
+            print(f"An error occurred: {type(e).__name__}: {e}")
 
 
 if __name__ == '__main__':
