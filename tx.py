@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 from typing import NamedTuple, Any, Generator
@@ -75,26 +72,34 @@ def gstreamer_process(opts: Options) -> Generator[subprocess.Popen, Any, None]:
     device_path = f"/dev/video{opts.video_device}"
     fr = parse_frame_rate(opts.fps)
 
-    # GStreamerパイプライン。出力を標準出力(stdout)に送る
-    # `fd:1` は標準出力を意味する
     pipeline = (
-        f"gst-launch-1.0 v4l2src device={device_path} ! "
+        f"gst-launch-1.0 v4l2src device={device_path} io-mode=2 ! "
         f"image/jpeg,width={opts.xres},height={opts.yres},framerate={fr.numerator}/{fr.denominator} ! "
         f"jpegdec ! "
         f"videoconvert ! "
-        f"video/x-raw,format=BGR ! " # OpenCVで扱いやすいようにBGRフォーマットを指定
-        f"filesink location=/dev/stdout"
+        f"video/x-raw,format=BGR ! "
+        f"fdsink fd=1 sync=false"
     )
 
     print("--- GStreamer Command ---")
     print(pipeline)
     print("-------------------------")
 
-    proc = subprocess.Popen(shlex.split(pipeline), stdout=subprocess.PIPE)
+    proc = subprocess.Popen(
+        shlex.split(pipeline), 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE,
+        bufsize=0
+    )
     
-    # プロセスが正常に起動したかを確認
-    time.sleep(2) # GStreamerの起動を待つ
+    # GStreamerの起動失敗を即座にチェック
+    time.sleep(1) # 念のため、プロセスがエラーを吐き出すのを少し待つ
     if proc.poll() is not None:
+        # 起動直後にプロセスが終了した場合、エラーメッセージを読み取って表示
+        gst_errors = proc.stderr.read().decode('utf-8', errors='ignore') if proc.stderr else "N/A"
+        print("--- GStreamer immediate exit error ---")
+        print(gst_errors)
+        print("--------------------------------------")
         raise IOError(f"GStreamer process failed to start. Exit code: {proc.returncode}")
 
     try:
@@ -122,31 +127,40 @@ def send(opts: Options) -> None:
     vf.set_fourcc(opts.pix_fmt.four_cc)
     sender.set_video_frame(vf)
 
-    # 1フレームあたりのバイト数を計算 (高さ x 幅 x 3チャンネル)
     frame_size_bytes = opts.yres * opts.xres * 3
 
     with sender:
         with gstreamer_process(opts) as proc:
             stdout = proc.stdout
-            if stdout is None:
-                raise IOError("Could not get stdout from GStreamer process.")
+            stderr = proc.stderr
+            if stdout is None or stderr is None:
+                raise IOError("Could not get stdout/stderr from GStreamer process.")
 
             print(f"Sending NDI stream '{opts.sender_name}' at {float(ndi_fr):.2f} FPS...")
             while True:
-                # GStreamerから1フレーム分のデータを読み込む
-                frame_data = stdout.read(frame_size_bytes)
+                buffer = bytearray()
+                bytes_left = frame_size_bytes
+                
+                while bytes_left > 0:
+                    chunk = stdout.read(bytes_left)
+                    if not chunk:
+                        break
+                    buffer.extend(chunk)
+                    bytes_left -= len(chunk)
+                
+                frame_data = bytes(buffer)
+
                 if len(frame_data) < frame_size_bytes:
                     print("GStreamer stream ended or data incomplete.")
+                    gst_errors = stderr.read().decode('utf-8', errors='ignore')
+                    if gst_errors:
+                        print("--- GStreamer Error Output ---")
+                        print(gst_errors.strip())
+                        print("------------------------------")
                     break
                 
-                # 読み込んだバイト列をNumPy配列に変換
-                # GStreamerからはBGRフォーマットでデータが来る
                 bgr_frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((opts.yres, opts.xres, 3))
-                
-                # 指定されたピクセルフォーマットに変換
                 converted_frame = cv2.cvtColor(bgr_frame, opts.pix_fmt.cv_color_code)
-                
-                # NDIで送信
                 sender.write_video_async(converted_frame.ravel())
 
 
