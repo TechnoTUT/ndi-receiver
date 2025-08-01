@@ -1,37 +1,29 @@
 from __future__ import annotations
 
-from typing import NamedTuple, Any, Generator
-from typing_extensions import Self
 import enum
 from fractions import Fraction
-from contextlib import contextmanager
-import time
-import subprocess
-import shlex
+from typing import NamedTuple
+from typing_extensions import Self
 
 import click
 import cv2
 import numpy as np
 
-# pip install cyndilib
 try:
-    from cyndilib.wrapper.ndi_structs import FourCC
-    from cyndilib.video_frame import VideoSendFrame
     from cyndilib.sender import Sender
+    from cyndilib.video_frame import VideoSendFrame
+    from cyndilib.wrapper.ndi_structs import FourCC
 except ImportError:
     print("Error: cyndilib is not installed. Please run 'pip install cyndilib'")
     exit(1)
 
 
 class PixFmt(enum.Enum):
-    """
-    サポートするピクセルフォーマットと、対応するNDIのFourCCをマッピング
-    GStreamerから受け取るBGRフォーマットを変換
-    """
     RGBA = (FourCC.RGBA, cv2.COLOR_BGR2RGBA)
     BGRA = (FourCC.BGRA, cv2.COLOR_BGR2BGRA)
+    BGR = (FourCC.BGRX, None) 
 
-    def __init__(self, four_cc: FourCC, cv_color_code: int):
+    def __init__(self, four_cc: FourCC, cv_color_code: int | None):
         self.four_cc = four_cc
         self.cv_color_code = cv_color_code
 
@@ -47,138 +39,97 @@ class Options(NamedTuple):
     pix_fmt: PixFmt
     xres: int
     yres: int
-    fps: str
-    video_device: str | int
-    sender_name: str = 'TX'
+    fps: int
+    video_device: int
+    sender_name: str
 
 
 def parse_frame_rate(fr_str: str) -> Fraction:
-    """
-    "30", "29.97", "30000/1001" のような文字列をFractionオブジェクトに変換
-    """
-    if '/' in fr_str:
-        n, d = [int(s) for s in fr_str.split('/')]
-    elif '.' in fr_str:
-        n = int(float(fr_str) * 1000)
-        d = 1001
-    else:
-        n = int(fr_str)
-        d = 1
-    return Fraction(n, d)
+    common_rates = {
+        "23.98": Fraction(24000, 1001),
+        "29.97": Fraction(30000, 1001),
+        "59.94": Fraction(60000, 1001),
+    }
+    if fr_str in common_rates:
+        return common_rates[fr_str]
 
-
-@contextmanager
-def gstreamer_process(opts: Options) -> Generator[subprocess.Popen, Any, None]:
-    device_path = f"/dev/video{opts.video_device}"
-    fr = parse_frame_rate(opts.fps)
-
-    pipeline = (
-        f"gst-launch-1.0 v4l2src device={device_path} io-mode=2 ! "
-        f"image/jpeg,width={opts.xres},height={opts.yres},framerate={fr.numerator}/{fr.denominator} ! "
-        f"jpegdec ! "
-        f"videoconvert ! "
-        f"video/x-raw,format=BGR ! "
-        f"fdsink fd=1 sync=false"
-    )
-
-    print("--- GStreamer Command ---")
-    print(pipeline)
-    print("-------------------------")
-
-    proc = subprocess.Popen(
-        shlex.split(pipeline), 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.PIPE,
-        bufsize=0
-    )
+    if "/" in fr_str:
+        n, d = [int(s) for s in fr_str.split("/")]
+        return Fraction(n, d)
     
-    # GStreamerの起動失敗を即座にチェック
-    time.sleep(1) # 念のため、プロセスがエラーを吐き出すのを少し待つ
-    if proc.poll() is not None:
-        # 起動直後にプロセスが終了した場合、エラーメッセージを読み取って表示
-        gst_errors = proc.stderr.read().decode('utf-8', errors='ignore') if proc.stderr else "N/A"
-        print("--- GStreamer immediate exit error ---")
-        print(gst_errors)
-        print("--------------------------------------")
-        raise IOError(f"GStreamer process failed to start. Exit code: {proc.returncode}")
+    if "." in fr_str:
+        return Fraction(fr_str).limit_denominator(2000)
 
-    try:
-        yield proc
-    finally:
-        print("Terminating GStreamer process.")
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            print("GStreamer did not terminate gracefully, killing.")
-            proc.kill()
+    return Fraction(int(fr_str), 1)
 
 
-def send(opts: Options) -> None:
-    """
-    GStreamerからパイプで受け取ったフレームをNDIストリームとして送信
-    """
-    ndi_fr = parse_frame_rate(opts.fps)
-    
+def capture_and_send(opts: Options) -> None:
+    cap = cv2.VideoCapture(opts.video_device)
+    if not cap.isOpened():
+        raise IOError(f"Could not open video device: {opts.video_device}")
+
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, opts.xres)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, opts.yres)
+    cap.set(cv2.CAP_PROP_FPS, opts.fps)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    actual_xres = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_yres = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Camera opened with settings: {actual_xres}x{actual_yres} @ {actual_fps:.2f} FPS")
+
+    if actual_xres != opts.xres or actual_yres != opts.yres:
+        print(f"Warning: Camera does not support {opts.xres}x{opts.yres}. Using {actual_xres}x{actual_yres} instead.")
+
     sender = Sender(opts.sender_name)
     vf = VideoSendFrame()
-    vf.set_resolution(opts.xres, opts.yres)
+    vf.set_resolution(actual_xres, actual_yres)
+    
+    ndi_fr = Fraction(actual_fps).limit_denominator()
     vf.set_frame_rate(ndi_fr)
+
     vf.set_fourcc(opts.pix_fmt.four_cc)
     sender.set_video_frame(vf)
 
-    frame_size_bytes = opts.yres * opts.xres * 3
+    print(f"Sending NDI stream '{opts.sender_name}' at {actual_fps:.2f} FPS...")
 
     with sender:
-        with gstreamer_process(opts) as proc:
-            stdout = proc.stdout
-            stderr = proc.stderr
-            if stdout is None or stderr is None:
-                raise IOError("Could not get stdout/stderr from GStreamer process.")
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame. Exiting...")
+                break
 
-            print(f"Sending NDI stream '{opts.sender_name}' at {float(ndi_fr):.2f} FPS...")
-            while True:
-                buffer = bytearray()
-                bytes_left = frame_size_bytes
-                
-                while bytes_left > 0:
-                    chunk = stdout.read(bytes_left)
-                    if not chunk:
-                        break
-                    buffer.extend(chunk)
-                    bytes_left -= len(chunk)
-                
-                frame_data = bytes(buffer)
+            # 色変換
+            if opts.pix_fmt.cv_color_code is not None:
+                converted_frame = cv2.cvtColor(frame, opts.pix_fmt.cv_color_code)
+            else:
+                b, g, r = cv2.split(frame)
+                alpha = np.full(b.shape, 255, dtype=b.dtype)
+                converted_frame = cv2.merge((b, g, r, alpha))
 
-                if len(frame_data) < frame_size_bytes:
-                    print("GStreamer stream ended or data incomplete.")
-                    gst_errors = stderr.read().decode('utf-8', errors='ignore')
-                    if gst_errors:
-                        print("--- GStreamer Error Output ---")
-                        print(gst_errors.strip())
-                        print("------------------------------")
-                    break
-                
-                bgr_frame = np.frombuffer(frame_data, dtype=np.uint8).reshape((opts.yres, opts.xres, 3))
-                converted_frame = cv2.cvtColor(bgr_frame, opts.pix_fmt.cv_color_code)
-                sender.write_video_async(converted_frame.ravel())
+            sender.write_video_async(converted_frame.ravel())
+
+    cap.release()
+    print("Stream stopped.")
 
 
 @click.command()
 @click.option(
     '--pix-fmt',
     type=click.Choice([m.name for m in PixFmt], case_sensitive=False),
-    default=PixFmt.RGBA.name,
+    default=PixFmt.BGR.name,
     show_default=True,
     help='Pixel format for the NDI stream.',
 )
 @click.option('-x', '--x-res', type=int, default=1920, show_default=True, help='Horizontal resolution.')
 @click.option('-y', '--y-res', type=int, default=1080, show_default=True, help='Vertical resolution.')
-@click.option('--fps', type=str, default='30', show_default=True, help='Frame rate (e.g., 30, 60, 30000/1001).')
+@click.option('--fps', type=str, default='30', show_default=True, help='Frame rate (e.g., 30, 29.97).')
 @click.option(
     '-d', '--video-device',
-    type=str,
-    default='0',
+    type=int,
+    default=0,
     show_default=True,
     help='Video device index (e.g., 0 for /dev/video0).',
 )
@@ -189,26 +140,26 @@ def send(opts: Options) -> None:
     show_default=True,
     help='NDI name for the sender.',
 )
-def main(pix_fmt: str, x_res: int, y_res: int, fps: str, video_device: str, sender_name: str):
+def main(pix_fmt: str, x_res: int, y_res: int, fps: str, video_device: int, sender_name: str):
     """
-    Captures video from a local webcam using a GStreamer subprocess and sends it as an NDI stream.
+    Captures video directly from a webcam using OpenCV and sends it as a low-latency NDI stream.
     """
     try:
-        dev = int(video_device) if video_device.isdigit() else video_device
+        frame_rate = int(parse_frame_rate(fps))
+        
         opts = Options(
             pix_fmt=PixFmt.from_str(pix_fmt),
             xres=x_res,
             yres=y_res,
-            fps=fps,
-            video_device=dev,
+            fps=frame_rate,
+            video_device=video_device,
             sender_name=sender_name,
         )
-        send(opts)
-    except (IOError, ValueError, KeyboardInterrupt, Exception) as e:
-        if isinstance(e, KeyboardInterrupt):
-            print("\nStream stopped by user.")
-        else:
-            print(f"An error occurred: {type(e).__name__}: {e}")
+        capture_and_send(opts)
+    except (IOError, ValueError) as e:
+        print(f"An error occurred: {type(e).__name__}: {e}")
+    except KeyboardInterrupt:
+        print("\nStream stopped by user.")
 
 
 if __name__ == '__main__':
