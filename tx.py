@@ -30,7 +30,6 @@ except ImportError:
 
 
 class PixFmt(enum.Enum):
-    """NDIのピクセルフォーマットとOpenCVの色変換コードを対応させるEnum"""
     RGBA = (FourCC.RGBA, cv2.COLOR_BGR2RGBA)
     BGRA = (FourCC.BGRA, cv2.COLOR_BGR2BGRA)
     BGR = (FourCC.BGRX, None)
@@ -48,7 +47,6 @@ class PixFmt(enum.Enum):
 
 
 class Options(NamedTuple):
-    """コマンドラインオプションを保持するデータクラス"""
     pix_fmt: PixFmt
     xres: int
     yres: int
@@ -61,11 +59,11 @@ class Options(NamedTuple):
     audio_channels: int
 
 
-class VideoCaptureThread(threading.Thread):
-    """カメラから映像をキャプチャし、生のフレームをキューに入れるスレッド"""
-    def __init__(self, device_index: int, width: int, height: int, fps: float, out_queue: queue.Queue):
+class VideoSourceThread(threading.Thread):
+    def __init__(self, device_index: int, width: int, height: int, fps: float, out_queue: queue.Queue, pix_fmt: PixFmt):
         super().__init__()
         self.out_queue = out_queue
+        self.pix_fmt = pix_fmt
         self.running = True
         self.daemon = True
 
@@ -83,7 +81,6 @@ class VideoCaptureThread(threading.Thread):
         self.actual_yres = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
 
-
     def run(self):
         while self.running:
             ret, frame = self.cap.read()
@@ -91,56 +88,26 @@ class VideoCaptureThread(threading.Thread):
                 time.sleep(0.01)
                 continue
             
+            if self.pix_fmt.cv_color_code is not None:
+                processed_frame = cv2.cvtColor(frame, self.pix_fmt.cv_color_code)
+            else:
+                b, g, r = cv2.split(frame)
+                alpha = np.full(b.shape, 255, dtype=b.dtype)
+                processed_frame = cv2.merge((b, g, r, alpha))
+            
             if self.out_queue.full():
                 try:
                     self.out_queue.get_nowait()
                 except queue.Empty:
                     pass
-            self.out_queue.put(frame)
+            self.out_queue.put(processed_frame)
 
     def stop(self):
         self.running = False
         self.join(timeout=2)
         self.cap.release()
 
-class VideoProcessThread(threading.Thread):
-    """生の映像フレームを処理（色変換）し、別のキューに入れるスレッド"""
-    def __init__(self, in_queue: queue.Queue, out_queue: queue.Queue, pix_fmt: PixFmt):
-        super().__init__()
-        self.in_queue = in_queue
-        self.out_queue = out_queue
-        self.pix_fmt = pix_fmt
-        self.running = True
-        self.daemon = True
-
-    def run(self):
-        while self.running:
-            try:
-                frame = self.in_queue.get(timeout=1.0)
-                
-                if self.pix_fmt.cv_color_code is not None:
-                    processed_frame = cv2.cvtColor(frame, self.pix_fmt.cv_color_code)
-                else:
-                    b, g, r = cv2.split(frame)
-                    alpha = np.full(b.shape, 255, dtype=b.dtype)
-                    processed_frame = cv2.merge((b, g, r, alpha))
-                
-                if self.out_queue.full():
-                    try:
-                        self.out_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                self.out_queue.put(processed_frame)
-
-            except queue.Empty:
-                continue
-
-    def stop(self):
-        self.running = False
-        self.join(timeout=2)
-
 class SendThread(threading.Thread):
-    """送信キューからデータを取り出し、NDI送信するスレッド"""
     def __init__(self, sender: Sender, in_queue: queue.Queue, has_audio: bool):
         super().__init__()
         self.sender = sender
@@ -167,7 +134,6 @@ class SendThread(threading.Thread):
 
 
 def parse_frame_rate(fr_str: str) -> Fraction:
-    """文字列からフレームレートをFractionオブジェクトに変換する"""
     common_rates = {"23.98": Fraction(24000, 1001), "29.97": Fraction(30000, 1001), "59.94": Fraction(60000, 1001)}
     if fr_str in common_rates: return common_rates[fr_str]
     if "/" in fr_str: n, d = [int(s) for s in fr_str.split("/")]; return Fraction(n, d)
@@ -176,27 +142,20 @@ def parse_frame_rate(fr_str: str) -> Fraction:
 
 
 def capture_and_send(opts: Options) -> None:
-    """各処理スレッドを管理し、NDIストリームを送信する"""
-    
-    raw_video_queue = queue.Queue(maxsize=1)
     processed_video_queue = queue.Queue(maxsize=1)
     send_queue = queue.Queue(maxsize=2)
     
     try:
-        video_capture_thread = VideoCaptureThread(
-            opts.video_device, opts.xres, opts.yres, opts.fps, raw_video_queue
+        video_source_thread = VideoSourceThread(
+            opts.video_device, opts.xres, opts.yres, opts.fps, processed_video_queue, opts.pix_fmt
         )
     except IOError as e:
-        print(f"Fatal: Could not initialize video capture thread. Error: {e}", file=sys.stderr)
+        print(f"Fatal: Could not initialize video source thread. Error: {e}", file=sys.stderr)
         return
 
-    video_process_thread = VideoProcessThread(
-        raw_video_queue, processed_video_queue, opts.pix_fmt
-    )
-
-    actual_xres = video_capture_thread.actual_xres
-    actual_yres = video_capture_thread.actual_yres
-    actual_fps = video_capture_thread.actual_fps
+    actual_xres = video_source_thread.actual_xres
+    actual_yres = video_source_thread.actual_yres
+    actual_fps = video_source_thread.actual_fps
     print(f"Camera opened with settings: {actual_xres}x{actual_yres} @ {actual_fps:.2f} FPS")
 
     sender = Sender(opts.sender_name)
@@ -245,8 +204,7 @@ def capture_and_send(opts: Options) -> None:
 
     send_thread = SendThread(sender, send_queue, has_audio=not opts.no_audio)
 
-    video_capture_thread.start()
-    video_process_thread.start()
+    video_source_thread.start()
     if audio_stream:
         audio_stream.start()
     send_thread.start()
@@ -304,8 +262,7 @@ def capture_and_send(opts: Options) -> None:
         if audio_stream:
             audio_stream.stop()
             audio_stream.close()
-        video_process_thread.stop()
-        video_capture_thread.stop()
+        video_source_thread.stop()
         print("Stream stopped.")
 
 
@@ -322,7 +279,6 @@ def capture_and_send(opts: Options) -> None:
 @click.option('--audio-channels', type=int, default=2, show_default=True, help='Number of audio channels (ignored if --no-audio).')
 @click.option('-n', '--sender-name', type=str, default='TX', show_default=True, help='NDI name for the sender.')
 def main(list_devices: bool, no_audio: bool, pix_fmt: str, x_res: int, y_res: int, fps: str, video_device: int, audio_device: int, sample_rate: int, audio_channels: int, sender_name: str):
-    """Captures video and/or audio from devices and sends them as a low-latency NDI stream."""
     if list_devices:
         print("--- Available Video Devices (OpenCV) ---")
         for i in range(10):
