@@ -13,7 +13,6 @@ import cv2
 import numpy as np
 from typing_extensions import Self
 
-# --- ライブラリのインポートとエラーチェック ---
 try:
     import sounddevice as sd
 except ImportError:
@@ -211,15 +210,18 @@ def capture_and_send(opts: Options) -> None:
     audio_queue = None
 
     if not opts.no_audio:
-        audio_queue = queue.Queue(maxsize=2)
+        audio_queue = queue.Queue(maxsize=10)
         if actual_fps == 0:
             raise ValueError("Actual FPS from camera is 0, cannot calculate audio samples per frame.")
-        samples_per_frame = round(opts.sample_rate / actual_fps)
         
+        samples_per_chunk = round(opts.sample_rate / actual_fps / 4)
+        if samples_per_chunk == 0:
+            samples_per_chunk = 1
+
         af = AudioSendFrame()
         af.sample_rate = opts.sample_rate
         af.num_channels = opts.audio_channels
-        af.set_max_num_samples(samples_per_frame)
+        af.set_max_num_samples(round(opts.sample_rate / actual_fps))
         sender.set_audio_frame(af)
         
         def audio_callback(indata, frames, time, status):
@@ -237,7 +239,7 @@ def capture_and_send(opts: Options) -> None:
         audio_stream = sd.InputStream(
             device=opts.audio_device, samplerate=opts.sample_rate,
             channels=opts.audio_channels, callback=audio_callback,
-            blocksize=samples_per_frame, dtype='float32',
+            blocksize=samples_per_chunk, dtype='float32',
             latency='low'
         )
 
@@ -256,21 +258,16 @@ def capture_and_send(opts: Options) -> None:
                 last_good_video_frame = None
                 try:
                     last_good_video_frame = processed_video_queue.get(timeout=5.0)
-                    audio_queue.get(timeout=5.0)
+                    for _ in range(4):
+                        audio_queue.get(timeout=5.0)
                     print("Initial audio and video frames received. Starting stream.")
                 except queue.Empty:
                     raise RuntimeError("Failed to receive initial audio or video frame within 5 seconds.")
 
                 while True:
                     try:
-                        audio_data = audio_queue.get(timeout=2.0)
-                        
-                        if audio_queue.qsize() > (audio_queue.maxsize // 2):
-                            while not audio_queue.empty():
-                                try:
-                                    audio_data = audio_queue.get_nowait()
-                                except queue.Empty:
-                                    break
+                        audio_chunks = [audio_queue.get(timeout=2.0) for _ in range(4)]
+                        audio_data = np.concatenate(audio_chunks, axis=1)
                         
                         try:
                             while True:
