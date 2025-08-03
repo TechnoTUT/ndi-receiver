@@ -3,10 +3,10 @@ NDIを活用することでDJイベント "The Utopia Tone" の映像伝送をIP
 PythonとSDL2を使用してNDIソースを受信し、全画面表示を行ったり、OpenCVを使用してNDIソースの送信を行います。
 
 ## 使い方
-動作にはPython3及びavahi-daemon、libgl1-mesa-devが必要です。
+動作にはPython3及びavahi-daemon、libgl1-mesa-dev、portaudio19-devが必要です。
 以下のコマンドで必要なパッケージをインストールしてください。
 ```bash
-$ sudo apt install python3 python3-pip python3-venv avahi-daemon libgl1-mesa-dev
+$ sudo apt install python3 python3-pip python3-venv avahi-daemon libgl1-mesa-dev portaudio19-dev
 ```
 
 次に、リポジトリをクローンし、仮想環境を作成して依存関係をインストールします。
