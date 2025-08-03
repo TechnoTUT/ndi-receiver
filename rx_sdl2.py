@@ -66,12 +66,12 @@ class Options(NamedTuple):
 def get_source(finder: Finder, name: str) -> Source:
     """Finderを使い、完全な名前またはストリーム名でNDIソースを検索する
     """
-    click.echo('NDIソースを待機中...')
+    click.echo('Waiting for NDI sources...')
     finder.wait_for_sources(10)
     for source in finder:
         if source.name == name or source.stream_name == name:
             return source
-    raise Exception(f'ソースが見つかりません。利用可能なソース: {finder.get_source_names()}')
+    raise Exception(f'Source not found. Available sources: {finder.get_source_names()}')
 
 
 def wait_for_first_frame(receiver: Receiver) -> None:
@@ -79,12 +79,12 @@ def wait_for_first_frame(receiver: Receiver) -> None:
     """
     vf = receiver.frame_sync.video_frame
     assert vf is not None
-    click.echo('最初のフレームを待機中...')
+    click.echo('Waiting for the first frame...')
     while receiver.is_connected():
         receiver.frame_sync.capture_video()
         resolution = vf.get_resolution()
         if min(resolution) > 0 and vf.get_data_size() > 0:
-            click.echo('フレームを取得しました。')
+            click.echo('Frame received.')
             return
         time.sleep(0.01)
 
@@ -137,7 +137,7 @@ def init_window(title: str, width: int, height: int, fullscreen: bool):
     """SDL2とOpenGLを使用してウィンドウを初期化する
     """
     if sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO) != 0:
-        raise RuntimeError(f"SDL_Initエラー: {sdl2.SDL_GetError()}")
+        raise RuntimeError(f"SDL_Init Error: {sdl2.SDL_GetError()}")
 
     sdl2.SDL_GL_SetAttribute(sdl2.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
     sdl2.SDL_GL_SetAttribute(sdl2.SDL_GL_CONTEXT_MINOR_VERSION, 1)
@@ -153,7 +153,7 @@ def init_window(title: str, width: int, height: int, fullscreen: bool):
         flags
     )
     if not window:
-        raise RuntimeError(f"SDL_CreateWindowエラー: {sdl2.SDL_GetError()}")
+        raise RuntimeError(f"SDL_CreateWindow Error: {sdl2.SDL_GetError()}")
 
     sdl2.SDL_GL_CreateContext(window)
     sdl2.SDL_ShowCursor(sdl2.SDL_DISABLE)
@@ -208,7 +208,7 @@ def play_sdl(options: Options):
                 # --- 切断状態の処理 ---
                 render_waiting_message()
                 if time.time() >= reconnect_cooldown_until:
-                    click.echo("NDI接続を試行しています...")
+                    click.echo("Attempting to connect to NDI source...")
                     try:
                         source = get_source(finder, options.sender_name)
                         receiver = Receiver(
@@ -220,23 +220,23 @@ def play_sdl(options: Options):
 
                         i = 0
                         while not receiver.is_connected():
-                            if i > 30: raise Exception('タイムアウト')
+                            if i > 30: raise Exception('Timeout')
                             time.sleep(0.1)
                             i += 1
                         
                         wait_for_first_frame(receiver)
                         is_connected = True
-                        click.echo("NDIソースに接続しました。")
+                        click.echo("Connected to NDI source.")
 
                     except Exception as e:
-                        click.echo(f"接続試行中にエラー: {e}", err=True)
+                        click.echo(f"Error during connection attempt: {e}", err=True)
                         if receiver:
                             receiver = None; gc.collect()
                         reconnect_cooldown_until = time.time() + 5.0 # 5秒後に再試行
             else:
                 # --- 接続状態の処理 ---
                 if not receiver or not receiver.is_connected():
-                    click.echo("接続が失われました。", err=True)
+                    click.echo("Connection lost.", err=True)
                     is_connected = False
                     if receiver: receiver = None; gc.collect()
                     reconnect_cooldown_until = time.time() + 5.0
@@ -253,7 +253,7 @@ def play_sdl(options: Options):
                         render_texture(last_frame_data, last_frame_w, last_frame_h, win_w, win_h, texture_id, options.recv_fmt)
 
                     except Exception as e:
-                        click.echo(f"フレームの取得または描画中にエラー: {e}", err=True)
+                        click.echo(f"Error during frame capture or rendering: {e}", err=True)
                         is_connected = False
                         if receiver: receiver = None; gc.collect()
                         reconnect_cooldown_until = time.time() + 5.0
@@ -262,27 +262,27 @@ def play_sdl(options: Options):
             time.sleep(0.001) # メインループのCPU使用率を抑制
 
     finally:
-        click.echo("クリーンアップ処理を実行しています...")
+        click.echo("Cleaning up resources...")
         if finder and hasattr(finder, 'destroy'): finder.destroy()
         if receiver: receiver = None; gc.collect()
         
         glDeleteTextures(1, [texture_id])
         sdl2.SDL_DestroyWindow(window)
         sdl2.SDL_Quit()
-        click.echo("プログラムを終了しました。")
+        click.echo("Program terminated.")
 
 
 @click.command()
 @click.option(
-    '-s', '--sender-name', type=str, default='ffmpeg_sender', show_default=True, help='接続するNDIソース名')
+    '-s', '--sender-name', type=str, default='ffmpeg_sender', show_default=True, help='NDI source name to connect to')
 @click.option(
-    '-f', '--recv-fmt', type=click.Choice(choices=[m.name for m in RecvFmt]), default='rgb', show_default=True, help='受信するピクセルフォーマット')
+    '-f', '--recv-fmt', type=click.Choice(choices=[m.name for m in RecvFmt]), default='rgb', show_default=True, help='Pixel format for receiving')
 @click.option(
-    '-b', '--recv-bandwidth', type=click.Choice(choices=[m.name for m in Bandwidth]), default='highest', show_default=True, help='受信帯域')
+    '-b', '--recv-bandwidth', type=click.Choice(choices=[m.name for m in Bandwidth]), default='highest', show_default=True, help='Receiving bandwidth')
 @click.option(
-    '--fullscreen', is_flag=True, help='フルスクリーンモードで起動する')
+    '--fullscreen', is_flag=True, help='Start in fullscreen mode')
 def main(sender_name: str, recv_fmt: str, recv_bandwidth: str, fullscreen: bool):
-    """SDL2とPyOpenGLを使用してNDIストリームを表示するビューア"""
+    """A viewer for NDI streams using SDL2 and PyOpenGL."""
     options = Options(
         sender_name=sender_name,
         recv_fmt=RecvFmt.from_str(recv_fmt),
@@ -292,7 +292,7 @@ def main(sender_name: str, recv_fmt: str, recv_bandwidth: str, fullscreen: bool)
     try:
         play_sdl(options)
     except Exception as e:
-        click.echo(f"致命的なエラーが発生しました: {e}", err=True)
+        click.echo(f"A fatal error occurred: {e}", err=True)
 
 
 if __name__ == '__main__':
