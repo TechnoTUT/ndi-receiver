@@ -179,8 +179,8 @@ def parse_frame_rate(fr_str: str) -> Fraction:
 def capture_and_send(opts: Options) -> None:
     """各処理スレッドを管理し、NDIストリームを送信する"""
     
-    raw_video_queue = queue.Queue(maxsize=2)
-    processed_video_queue = queue.Queue(maxsize=2)
+    raw_video_queue = queue.Queue(maxsize=1)
+    processed_video_queue = queue.Queue(maxsize=1)
     send_queue = queue.Queue(maxsize=2)
     
     try:
@@ -211,7 +211,7 @@ def capture_and_send(opts: Options) -> None:
     audio_queue = None
 
     if not opts.no_audio:
-        audio_queue = queue.Queue(maxsize=10)
+        audio_queue = queue.Queue(maxsize=2)
         if actual_fps == 0:
             raise ValueError("Actual FPS from camera is 0, cannot calculate audio samples per frame.")
         samples_per_frame = round(opts.sample_rate / actual_fps)
@@ -263,10 +263,8 @@ def capture_and_send(opts: Options) -> None:
 
                 while True:
                     try:
-                        # 1. 音声フレームが到着するまで待つ
                         audio_data = audio_queue.get(timeout=2.0)
                         
-                        # 修正: 遅延が蓄積し始めた場合（キューの半分以上が埋まっている場合）のみ、古い音声データを捨てる
                         if audio_queue.qsize() > (audio_queue.maxsize // 2):
                             while not audio_queue.empty():
                                 try:
@@ -274,14 +272,12 @@ def capture_and_send(opts: Options) -> None:
                                 except queue.Empty:
                                     break
                         
-                        # 2. 処理済みの最新映像フレームを取得
                         try:
                             while True:
                                 last_good_video_frame = processed_video_queue.get_nowait()
                         except queue.Empty:
                             pass
                         
-                        # 3. 送信キューに最新のペアを入れる
                         if send_queue.full():
                             try:
                                 send_queue.get_nowait()
@@ -293,7 +289,6 @@ def capture_and_send(opts: Options) -> None:
                         print("Error: Audio queue was empty for 2 seconds. Stopping stream.", file=sys.stderr)
                         break
             else:
-                # 映像のみの場合
                 while True:
                     try:
                         frame = processed_video_queue.get(timeout=2.0)
