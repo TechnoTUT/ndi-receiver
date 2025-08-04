@@ -90,15 +90,21 @@ class VideoSourceThread(threading.Thread):
             
             processed_frame = cv2.cvtColor(frame, self.pix_fmt.cv_color_code)
             
-            try:
-                self.out_queue.put(processed_frame, timeout=1.0)
-            except queue.Full:
-                print("Warning: Video source queue is full. Main loop may be lagging.", file=sys.stderr)
+            while self.running:
+                try:
+                    self.out_queue.put(processed_frame, timeout=1.0)
+                    break
+                except queue.Full:
+                    try:
+                        self.out_queue.get_nowait()
+                    except queue.Empty:
+                        pass
 
     def stop(self):
         self.running = False
         self.join(timeout=2)
         self.cap.release()
+
 
 class SendThread(threading.Thread):
     def __init__(self, sender: Sender, in_queue: queue.Queue, has_audio: bool):
@@ -209,7 +215,7 @@ def capture_and_send(opts: Options) -> None:
             raise ValueError("Actual FPS from camera is 0, cannot calculate audio samples per frame.")
         
         samples_per_frame = round(opts.sample_rate / actual_fps)
-        samples_per_chunk = samples_per_frame // 4
+        samples_per_chunk = max(64, samples_per_frame // 4)
         if samples_per_chunk == 0:
             samples_per_chunk = 1
 
@@ -224,16 +230,21 @@ def capture_and_send(opts: Options) -> None:
                 if 'input overflow' not in str(status):
                     print(f"Audio callback status: {status}", file=sys.stderr)
             if audio_queue:
-                try:
-                    audio_queue.put(indata.copy().T, timeout=1.0)
-                except queue.Full:
-                    print("Warning: Audio capture queue is full. Main loop may be lagging.", file=sys.stderr)
+                while True:
+                    try:
+                        audio_queue.put(indata.copy().T, timeout=1.0)
+                        break
+                    except queue.Full:
+                        try:
+                            audio_queue.get_nowait()
+                        except queue.Empty:
+                            break
 
         audio_stream = sd.InputStream(
             device=opts.audio_device, samplerate=opts.sample_rate,
             channels=opts.audio_channels, callback=audio_callback,
             blocksize=samples_per_chunk, dtype='float32',
-            latency='low'
+            latency=0.01
         )
 
     video_send_thread = VideoSendThread(sender, send_video_queue)
