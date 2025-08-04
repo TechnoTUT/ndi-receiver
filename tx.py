@@ -169,7 +169,7 @@ def capture_and_send(opts: Options) -> None:
     audio_queue = None
 
     if not opts.no_audio:
-        audio_queue = queue.Queue(maxsize=10)
+        audio_queue = queue.Queue(maxsize=4)
         if actual_fps == 0:
             raise ValueError("Actual FPS from camera is 0, cannot calculate audio samples per frame.")
         
