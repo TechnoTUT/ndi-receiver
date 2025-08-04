@@ -75,7 +75,7 @@ class VideoSourceThread(threading.Thread):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FPS, fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 4)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
         
         self.actual_xres = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.actual_yres = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -95,12 +95,10 @@ class VideoSourceThread(threading.Thread):
                 alpha = np.full(b.shape, 255, dtype=b.dtype)
                 processed_frame = cv2.merge((b, g, r, alpha))
             
-            if self.out_queue.full():
-                try:
-                    self.out_queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self.out_queue.put(processed_frame)
+            try:
+                self.out_queue.put(processed_frame, timeout=1.0)
+            except queue.Full:
+                print("Warning: Video source queue is full. Main loop may be lagging.", file=sys.stderr)
 
     def stop(self):
         self.running = False
@@ -143,7 +141,7 @@ def parse_frame_rate(fr_str: str) -> Fraction:
 
 def capture_and_send(opts: Options) -> None:
     processed_video_queue = queue.Queue(maxsize=1)
-    send_queue = queue.Queue(maxsize=2)
+    send_queue = queue.Queue(maxsize=1)
     
     try:
         video_source_thread = VideoSourceThread(
@@ -169,18 +167,19 @@ def capture_and_send(opts: Options) -> None:
     audio_queue = None
 
     if not opts.no_audio:
-        audio_queue = queue.Queue(maxsize=4)
+        audio_queue = queue.Queue(maxsize=1)
         if actual_fps == 0:
             raise ValueError("Actual FPS from camera is 0, cannot calculate audio samples per frame.")
         
-        samples_per_chunk = round(opts.sample_rate / actual_fps / 4)
+        samples_per_frame = round(opts.sample_rate / actual_fps)
+        samples_per_chunk = samples_per_frame // 4
         if samples_per_chunk == 0:
             samples_per_chunk = 1
 
         af = AudioSendFrame()
         af.sample_rate = opts.sample_rate
         af.num_channels = opts.audio_channels
-        af.set_max_num_samples(round(opts.sample_rate / actual_fps))
+        af.set_max_num_samples(samples_per_frame)
         sender.set_audio_frame(af)
         
         def audio_callback(indata, frames, time, status):
@@ -188,12 +187,10 @@ def capture_and_send(opts: Options) -> None:
                 if 'input overflow' not in str(status):
                     print(f"Audio callback status: {status}", file=sys.stderr)
             if audio_queue:
-                if audio_queue.full():
-                    try:
-                        audio_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                audio_queue.put(indata.copy().T)
+                try:
+                    audio_queue.put(indata.copy().T, timeout=1.0)
+                except queue.Full:
+                    print("Warning: Audio capture queue is full. Main loop may be lagging.", file=sys.stderr)
 
         audio_stream = sd.InputStream(
             device=opts.audio_device, samplerate=opts.sample_rate,
@@ -213,49 +210,30 @@ def capture_and_send(opts: Options) -> None:
         with sender:
             print("Starting assembler loop...")
             if not opts.no_audio and audio_queue is not None:
-                last_good_video_frame = None
-                try:
-                    last_good_video_frame = processed_video_queue.get(timeout=5.0)
-                    for _ in range(4):
-                        audio_queue.get(timeout=5.0)
-                    print("Initial audio and video frames received. Starting stream.")
-                except queue.Empty:
-                    raise RuntimeError("Failed to receive initial audio or video frame within 5 seconds.")
-
                 while True:
                     try:
+                        video_data = processed_video_queue.get(timeout=2.0)
+                        
                         audio_chunks = [audio_queue.get(timeout=2.0) for _ in range(4)]
                         audio_data = np.concatenate(audio_chunks, axis=1)
                         
-                        try:
-                            while True:
-                                last_good_video_frame = processed_video_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        
-                        if send_queue.full():
-                            try:
-                                send_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                        send_queue.put((last_good_video_frame, audio_data))
+                        send_queue.put((video_data, audio_data), timeout=1.0)
 
                     except queue.Empty:
-                        print("Error: Audio queue was empty for 2 seconds. Stopping stream.", file=sys.stderr)
+                        print("Error: Audio or video queue was empty for 2 seconds. Stopping stream.", file=sys.stderr)
                         break
+                    except queue.Full:
+                        print("Warning: Send queue is full. NDI sender might be blocked or slow.", file=sys.stderr)
             else:
                 while True:
                     try:
                         frame = processed_video_queue.get(timeout=2.0)
-                        if send_queue.full():
-                            try:
-                                send_queue.get_nowait()
-                            except queue.Empty:
-                                pass
-                        send_queue.put(frame)
+                        send_queue.put(frame, timeout=1.0)
                     except queue.Empty:
                         print("Error: Processed video queue was empty for 2 seconds. Stopping stream.", file=sys.stderr)
                         break
+                    except queue.Full:
+                        print("Warning: Send queue is full. NDI sender might be blocked or slow.", file=sys.stderr)
     finally:
         print("\nStopping stream resources...")
         send_thread.stop()
