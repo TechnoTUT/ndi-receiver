@@ -32,9 +32,9 @@ except ImportError:
 class PixFmt(enum.Enum):
     RGBA = (FourCC.RGBA, cv2.COLOR_BGR2RGBA)
     BGRA = (FourCC.BGRA, cv2.COLOR_BGR2BGRA)
-    BGR = (FourCC.BGRX, None)
+    BGRX = (FourCC.BGRX, cv2.COLOR_BGR2BGRA)
 
-    def __init__(self, four_cc: FourCC, cv_color_code: int | None):
+    def __init__(self, four_cc: FourCC, cv_color_code: int):
         self.four_cc = four_cc
         self.cv_color_code = cv_color_code
 
@@ -88,12 +88,7 @@ class VideoSourceThread(threading.Thread):
                 time.sleep(0.01)
                 continue
             
-            if self.pix_fmt.cv_color_code is not None:
-                processed_frame = cv2.cvtColor(frame, self.pix_fmt.cv_color_code)
-            else:
-                b, g, r = cv2.split(frame)
-                alpha = np.full(b.shape, 255, dtype=b.dtype)
-                processed_frame = cv2.merge((b, g, r, alpha))
+            processed_frame = cv2.cvtColor(frame, self.pix_fmt.cv_color_code)
             
             try:
                 self.out_queue.put(processed_frame, timeout=1.0)
@@ -131,6 +126,47 @@ class SendThread(threading.Thread):
         self.join(timeout=2)
 
 
+class VideoSendThread(threading.Thread):
+    def __init__(self, sender: Sender, in_queue: queue.Queue):
+        super().__init__()
+        self.sender = sender
+        self.in_queue = in_queue
+        self.running = True
+        self.daemon = True
+
+    def run(self):
+        while self.running:
+            try:
+                video_frame = self.in_queue.get(timeout=1.0)
+                self.sender.write_video_async(video_frame.ravel())
+            except queue.Empty:
+                continue
+
+    def stop(self):
+        self.running = False
+        self.join(timeout=2)
+
+class AudioSendThread(threading.Thread):
+    def __init__(self, sender: Sender, in_queue: queue.Queue):
+        super().__init__()
+        self.sender = sender
+        self.in_queue = in_queue
+        self.running = True
+        self.daemon = True
+
+    def run(self):
+        while self.running:
+            try:
+                audio_frame = self.in_queue.get(timeout=1.0)
+                self.sender.write_audio(audio_frame)
+            except queue.Empty:
+                continue
+
+    def stop(self):
+        self.running = False
+        self.join(timeout=2)
+
+
 def parse_frame_rate(fr_str: str) -> Fraction:
     common_rates = {"23.98": Fraction(24000, 1001), "29.97": Fraction(30000, 1001), "59.94": Fraction(60000, 1001)}
     if fr_str in common_rates: return common_rates[fr_str]
@@ -141,7 +177,8 @@ def parse_frame_rate(fr_str: str) -> Fraction:
 
 def capture_and_send(opts: Options) -> None:
     processed_video_queue = queue.Queue(maxsize=1)
-    send_queue = queue.Queue(maxsize=1)
+    send_video_queue = queue.Queue(maxsize=1)
+    send_audio_queue = queue.Queue(maxsize=2)
     
     try:
         video_source_thread = VideoSourceThread(
@@ -167,7 +204,7 @@ def capture_and_send(opts: Options) -> None:
     audio_queue = None
 
     if not opts.no_audio:
-        audio_queue = queue.Queue(maxsize=1)
+        audio_queue = queue.Queue(maxsize=2)
         if actual_fps == 0:
             raise ValueError("Actual FPS from camera is 0, cannot calculate audio samples per frame.")
         
@@ -199,12 +236,15 @@ def capture_and_send(opts: Options) -> None:
             latency='low'
         )
 
-    send_thread = SendThread(sender, send_queue, has_audio=not opts.no_audio)
+    video_send_thread = VideoSendThread(sender, send_video_queue)
+    audio_send_thread = AudioSendThread(sender, send_audio_queue) if not opts.no_audio else None
 
     video_source_thread.start()
     if audio_stream:
         audio_stream.start()
-    send_thread.start()
+    video_send_thread.start()
+    if audio_send_thread:
+        audio_send_thread.start()
 
     try:
         with sender:
@@ -213,12 +253,10 @@ def capture_and_send(opts: Options) -> None:
                 while True:
                     try:
                         video_data = processed_video_queue.get(timeout=2.0)
-                        
                         audio_chunks = [audio_queue.get(timeout=2.0) for _ in range(4)]
                         audio_data = np.concatenate(audio_chunks, axis=1)
-                        
-                        send_queue.put((video_data, audio_data), timeout=1.0)
-
+                        send_video_queue.put(video_data, timeout=1.0)
+                        send_audio_queue.put(audio_data, timeout=1.0)
                     except queue.Empty:
                         print("Error: Audio or video queue was empty for 2 seconds. Stopping stream.", file=sys.stderr)
                         break
@@ -228,7 +266,7 @@ def capture_and_send(opts: Options) -> None:
                 while True:
                     try:
                         frame = processed_video_queue.get(timeout=2.0)
-                        send_queue.put(frame, timeout=1.0)
+                        send_video_queue.put(frame, timeout=1.0)
                     except queue.Empty:
                         print("Error: Processed video queue was empty for 2 seconds. Stopping stream.", file=sys.stderr)
                         break
@@ -236,7 +274,9 @@ def capture_and_send(opts: Options) -> None:
                         print("Warning: Send queue is full. NDI sender might be blocked or slow.", file=sys.stderr)
     finally:
         print("\nStopping stream resources...")
-        send_thread.stop()
+        video_send_thread.stop()
+        if audio_send_thread:
+            audio_send_thread.stop()
         if audio_stream:
             audio_stream.stop()
             audio_stream.close()
@@ -247,7 +287,7 @@ def capture_and_send(opts: Options) -> None:
 @click.command()
 @click.option('--list-devices', is_flag=True, help='List available video and audio devices and exit.')
 @click.option('--no-audio', is_flag=True, help='Disable audio and send video only.')
-@click.option('--pix-fmt', type=click.Choice([m.name for m in PixFmt], case_sensitive=False), default=PixFmt.BGR.name, show_default=True, help='Pixel format.')
+@click.option('--pix-fmt', type=click.Choice([m.name for m in PixFmt], case_sensitive=False), default=PixFmt.BGRX.name, show_default=True, help='Pixel format.')
 @click.option('-x', '--x-res', type=int, default=1920, show_default=True, help='Horizontal resolution.')
 @click.option('-y', '--y-res', type=int, default=1080, show_default=True, help='Vertical resolution.')
 @click.option('--fps', type=str, default='30', show_default=True, help='Frame rate (e.g., 30, 29.97, 60000/1001).')
